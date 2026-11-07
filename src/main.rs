@@ -48,6 +48,8 @@ struct Settings {
     homeserver: String,
     /// The part after the colon in the user IDs of the bots.
     server_name: String,
+    /// Where the reverse proxy serves the webhooks, `https://<host>`: the bots tell it to the admins.
+    public_url: String,
     /// The users who may enable and disable the integrations.
     admins: Vec<String>,
     appservice: Appservice,
@@ -109,7 +111,8 @@ fn serve(settings: Settings) -> Result<(), String> {
         trusted_proxy: proxy,
         homeserver,
         server_name,
-        admins: _, // for the admin commands, in the next step
+        public_url,
+        admins,
         appservice: Appservice { as_token, hs_token },
     } = settings;
     let matrix = Arc::new(matrix::Matrix::new(homeserver, server_name, as_token));
@@ -121,23 +124,23 @@ fn serve(settings: Settings) -> Result<(), String> {
         let listener = tokio::net::TcpListener::bind(listen)
             .await
             .map_err(|e| format!("{listen}: {e}"))?;
-        let secrets = {
+        let loaded = {
             let matrix = matrix.clone();
             tokio::task::spawn_blocking(move || {
-                [(github::BOT, github::SETTINGS), (clickup::BOT, clickup::SETTINGS)].map(|(bot, kind)| {
-                    matrix.register(bot)?;
-                    let secret = matrix.account_data(bot, kind)?;
-                    Ok::<_, String>(secret.and_then(|data| data["secret"].as_str().map(str::to_string)))
-                })
+                let github = github::Github::load(matrix.clone(), admins, public_url)?;
+                matrix.register(clickup::BOT)?;
+                let clickup = matrix.account_data(clickup::BOT, None, clickup::SETTINGS)?;
+                let clickup = clickup.and_then(|data| data["secret"].as_str().map(str::to_string));
+                Ok::<_, String>((Arc::new(github), clickup))
             })
             .await
             .map_err(|e| e.to_string())?
         };
-        let [github_secret, clickup_secret] = secrets;
+        let (github, clickup_secret) = loaded?;
         // the reverse proxy forwards /github and /clickup only: the appservice paths are for the homeserver
-        let app = appservice::transactions(hs_token, matrix.clone())
-            .merge(github::webhook(github_secret?, matrix.clone()))
-            .merge(clickup::webhook(clickup_secret?, matrix.clone()));
+        let app = appservice::transactions(hs_token, matrix.clone(), github.clone())
+            .merge(github::webhook(github))
+            .merge(clickup::webhook(clickup_secret, matrix.clone()));
         // the payloads of big pushes reach a few megabytes
         let app = app
             .layer(DefaultBodyLimit::max(8 * 1024 * 1024))

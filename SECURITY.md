@@ -19,15 +19,15 @@ nothing it receives runs, changes a room's settings or reaches another system.
 - **GitHub and ClickUp:** a delivery counts only with a valid signature of the body (HMAC-SHA256 with the secret of
   the webhook, compared in constant time). Without a secret, before an admin enables the integration, the endpoint
   answers 503.
-- **Scripts:** a message counts only with the token of a hook. The room keeps the SHA-256 of the token, never the
-  token: room state is visible to every member. A leaked token lets whoever has it post as that hook, in its room
+- **Scripts:** a message counts only with the token of a hook. The bot keeps the SHA-256 of the token, never the
+  token. A leaked token lets whoever has it post as that hook, in its room
   only, until `!hooks revoke`.
 - **The homeserver:** the appservice paths (`/_matrix/app/`) count only with the `hs_token` of the registration. The
   reverse proxy does not forward them; the homeserver reaches the service directly.
-- **Commands:** the integrations are enabled and disabled only by the users in `admins`, in a direct room with the
-  bot, created without encryption since the bot refuses encrypted rooms: the replies carry the secrets, so never in
-  a room shared with others. Subscriptions and hooks are created and removed only by the moderators of the room
-  (the power level needed to change `m.room.power_levels`, or above).
+- **Commands:** the integrations are enabled and disabled only by the users in `admins`, in a room whose only
+  members are the admin and the bot (checked before answering), created without encryption since the bot refuses
+  encrypted rooms: the replies carry the secrets. Subscriptions and hooks are created and removed only by the
+  moderators of the room (the power level needed to change `m.room.power_levels`, or above).
 
 ### Secrets
 
@@ -36,9 +36,11 @@ nothing it receives runs, changes a room's settings or reaches another system.
 | `as_token`, `hs_token` | the settings file (mode `0640`) | root and the user of the service |
 | secret of the GitHub webhook | account data of `@github` on the homeserver | the bot; the admins of the homeserver (`!admin query account-data`) and root on its machine |
 | ClickUp API token and webhook secret | account data of `@clickup` | as above |
-| tokens of the hooks | nowhere: only their SHA-256, in room state | members of the room see the hash |
+| tokens of the hooks | nowhere: only their SHA-256, in the account data of the bot for the room | nobody, the hash as above |
 
-The account data of the bots is kept and backed up by the homeserver, like the messages: old backups keep a rotated
+Subscriptions are in the account data of the bot for each room, not in the state of the room: a bot joins without the
+power to write state, and the members do not need to see them (`!github list` shows them). The account data of the
+bots is kept and backed up by the homeserver, like the messages: old backups keep a rotated
 secret until they expire, so a leaked ClickUp token is revoked in ClickUp, not only replaced in the bot. The message
 with the ClickUp token is redacted as soon as it is read; until the homeserver prunes it, it is readable like any
 other message of that direct room.

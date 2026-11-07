@@ -1,3 +1,4 @@
+use crate::github::Github;
 use crate::matrix::Matrix;
 use crate::{clickup, github};
 use axum::Router;
@@ -12,6 +13,7 @@ use std::sync::Arc;
 struct Appservice {
     hs_token: String,
     matrix: Arc<Matrix>,
+    github: Arc<Github>,
 }
 
 #[derive(Deserialize)]
@@ -21,11 +23,15 @@ struct Transaction {
 }
 
 /// The side the homeserver calls: the room events that concern the bots.
-pub fn transactions(hs_token: String, matrix: Arc<Matrix>) -> Router {
+pub fn transactions(hs_token: String, matrix: Arc<Matrix>, github: Arc<Github>) -> Router {
     Router::new()
         .route("/_matrix/app/v1/transactions/{txn}", put(receive))
         .route("/_matrix/app/v1/ping", post(ping))
-        .with_state(Arc::new(Appservice { hs_token, matrix }))
+        .with_state(Arc::new(Appservice {
+            hs_token,
+            matrix,
+            github,
+        }))
 }
 
 async fn ping(State(appservice): State<Arc<Appservice>>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
@@ -44,6 +50,24 @@ async fn receive(
         return (StatusCode::FORBIDDEN, Json(json!({"errcode": "M_FORBIDDEN"})));
     }
     for event in transaction.events {
+        if let Some((room, sender, body)) = command(&event, &appservice.matrix, "!github") {
+            let github = appservice.github.clone();
+            tokio::task::spawn_blocking(move || github::command(&github, &room, &sender, &body));
+            continue;
+        }
+        if event["type"] == "m.room.encryption" {
+            // the bots stay out of encrypted rooms, also of a room that turns encrypted with them in it
+            let room = event["room_id"].as_str().unwrap_or_default().to_string();
+            let matrix = appservice.matrix.clone();
+            tokio::task::spawn_blocking(move || {
+                for bot in [github::BOT, clickup::BOT] {
+                    if let Err(e) = matrix.leave(&room, bot) {
+                        eprintln!("{e}");
+                    }
+                }
+            });
+            continue;
+        }
         if let Some((room, bot, usage)) = invitation(&event, &appservice.matrix) {
             let matrix = appservice.matrix.clone();
             let encrypted = encrypted(&event);
@@ -73,6 +97,24 @@ fn from_homeserver(headers: &HeaderMap, hs_token: &str) -> bool {
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or_default();
     digest(&SHA256, bearer.as_bytes()).as_ref() == digest(&SHA256, hs_token.as_bytes()).as_ref()
+}
+
+/// A message of a person (not of a bot) starting with `prefix`: the room, the sender and the text.
+fn command(event: &Value, matrix: &Matrix, prefix: &str) -> Option<(String, String, String)> {
+    if event["type"] != "m.room.message" {
+        return None;
+    }
+    let body = event["content"]["body"].as_str()?.trim();
+    let sender = event["sender"].as_str()?;
+    let bots = [github::BOT, clickup::BOT].map(|bot| matrix.user_id(bot));
+    if !(body == prefix || body.starts_with(&format!("{prefix} "))) || bots.iter().any(|bot| bot == sender) {
+        return None;
+    }
+    Some((
+        event["room_id"].as_str()?.to_string(),
+        sender.to_string(),
+        body.to_string(),
+    ))
 }
 
 /// An invitation of one of the bots: the room, the bot and what it says when it joins.
@@ -120,5 +162,41 @@ mod tests {
         assert!(super::invitation(&invite("@roberto:optionfactory.net", json!([])), &matrix).is_none());
         let encrypted = invite("@clickup:optionfactory.net", json!([{"type": "m.room.encryption"}]));
         assert!(super::encrypted(&encrypted));
+    }
+
+    #[test]
+    fn commands_are_messages_of_people_starting_with_the_prefix() {
+        let matrix = Matrix::new("http://homeserver".into(), "optionfactory.net".into(), "token".into());
+        let message = |sender: &str, body: &str| {
+            json!({"type": "m.room.message", "room_id": "!room:optionfactory.net", "sender": sender,
+                   "content": {"msgtype": "m.text", "body": body}})
+        };
+        let (room, sender, body) = super::command(
+            &message("@roberto:optionfactory.net", " !github list "),
+            &matrix,
+            "!github",
+        )
+        .unwrap();
+        assert_eq!(
+            (room.as_str(), sender.as_str(), body.as_str()),
+            ("!room:optionfactory.net", "@roberto:optionfactory.net", "!github list")
+        );
+        assert!(super::command(&message("@roberto:optionfactory.net", "!githubber"), &matrix, "!github").is_none());
+        assert!(
+            super::command(
+                &message("@roberto:optionfactory.net", "talk about !github"),
+                &matrix,
+                "!github"
+            )
+            .is_none()
+        );
+        assert!(
+            super::command(
+                &message("@github:optionfactory.net", "!github list"),
+                &matrix,
+                "!github"
+            )
+            .is_none()
+        );
     }
 }

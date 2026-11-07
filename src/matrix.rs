@@ -1,7 +1,9 @@
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The homeserver, seen from the appservice: every call acts as one of the bots, with the appservice token.
+/// The homeserver, seen from the appservice: every call acts as one of the bots, with the appservice token. All the
+/// calls block, for `spawn_blocking`.
 pub struct Matrix {
     homeserver: String,
     server_name: String,
@@ -29,31 +31,32 @@ impl Matrix {
         format!("@{bot}:{}", self.server_name)
     }
 
-    /// Posts an `m.room.message` as `bot`. All the calls block, for `spawn_blocking`.
-    pub fn send(&self, room: &str, bot: &str, content: &serde_json::Value) -> Result<(), String> {
+    /// Posts an `m.room.message` as `bot`.
+    pub fn send(&self, room: &str, bot: &str, content: &Value) -> Result<(), String> {
         let txn = format!("{}-{}", self.started, self.sent.fetch_add(1, Ordering::Relaxed));
-        let path = format!("rooms/{}/send/m.room.message/{txn}", encoded(room));
-        self.call(ureq::put(self.url(&path, bot)), content)
-            .map_err(|e| format!("message to {room} as {bot}: {e}"))
+        self.put(
+            &format!("rooms/{}/send/m.room.message/{txn}", encoded(room)),
+            bot,
+            content,
+        )
+        .map_err(|e| format!("message to {room} as {bot}: {e}"))
     }
 
     pub fn join(&self, room: &str, bot: &str) -> Result<(), String> {
-        let path = format!("rooms/{}/join", encoded(room));
-        self.call(ureq::post(self.url(&path, bot)), &serde_json::json!({}))
+        self.post(&format!("rooms/{}/join", encoded(room)), bot)
             .map_err(|e| format!("join of {room} as {bot}: {e}"))
     }
 
     /// Also declines an invitation.
     pub fn leave(&self, room: &str, bot: &str) -> Result<(), String> {
-        let path = format!("rooms/{}/leave", encoded(room));
-        self.call(ureq::post(self.url(&path, bot)), &serde_json::json!({}))
+        self.post(&format!("rooms/{}/leave", encoded(room)), bot)
             .map_err(|e| format!("leave of {room} as {bot}: {e}"))
     }
 
     /// Creates the user of the bot on the homeserver, if it is not there yet.
     pub fn register(&self, bot: &str) -> Result<(), String> {
         let url = format!("{}/_matrix/client/v3/register", self.homeserver);
-        let body = serde_json::json!({"type": "m.login.application_service", "username": bot});
+        let body = json!({"type": "m.login.application_service", "username": bot});
         let response = ureq::post(url)
             .config()
             .http_status_as_error(false)
@@ -71,22 +74,52 @@ impl Matrix {
         }
     }
 
-    /// The account data of `kind` of the bot: private to it, kept and backed up by the homeserver.
-    pub fn account_data(&self, bot: &str, kind: &str) -> Result<Option<serde_json::Value>, String> {
-        let path = format!("user/{}/account_data/{kind}", encoded(&self.user_id(bot)));
-        let response = ureq::get(self.url(&path, bot))
-            .header("Authorization", &format!("Bearer {}", self.as_token))
-            .call();
-        match response {
-            Ok(mut response) => response
-                .body_mut()
-                .read_to_string()
-                .map_err(|e| e.to_string())
-                .and_then(|json| serde_json::from_str(&json).map_err(|e| e.to_string()))
-                .map(Some)
-                .map_err(|e| format!("{kind} of {bot}: {e}")),
-            Err(ureq::Error::StatusCode(404)) => Ok(None),
-            Err(e) => Err(format!("{kind} of {bot}: {e}")),
+    /// The account data of `kind` of the bot, private to it, kept and backed up by the homeserver; of one room when
+    /// `room` is given.
+    pub fn account_data(&self, bot: &str, room: Option<&str>, kind: &str) -> Result<Option<Value>, String> {
+        self.get(&self.account_data_path(bot, room, kind), bot)
+            .map_err(|e| format!("{kind} of {bot}: {e}"))
+    }
+
+    pub fn set_account_data(&self, bot: &str, room: Option<&str>, kind: &str, data: &Value) -> Result<(), String> {
+        self.put(&self.account_data_path(bot, room, kind), bot, data)
+            .map_err(|e| format!("{kind} of {bot}: {e}"))
+    }
+
+    pub fn joined_rooms(&self, bot: &str) -> Result<Vec<String>, String> {
+        let rooms = self
+            .get("joined_rooms", bot)
+            .map_err(|e| format!("rooms of {bot}: {e}"))?;
+        Ok(rooms
+            .and_then(|rooms| serde_json::from_value(rooms["joined_rooms"].clone()).ok())
+            .unwrap_or_default())
+    }
+
+    pub fn joined_members(&self, room: &str, bot: &str) -> Result<Vec<String>, String> {
+        let members = self
+            .get(&format!("rooms/{}/joined_members", encoded(room)), bot)
+            .map_err(|e| format!("members of {room}: {e}"))?;
+        Ok(members
+            .and_then(|members| {
+                members["joined"]
+                    .as_object()
+                    .map(|joined| joined.keys().cloned().collect())
+            })
+            .unwrap_or_default())
+    }
+
+    /// The content of the `m.room.power_levels` of the room.
+    pub fn power_levels(&self, room: &str, bot: &str) -> Result<Value, String> {
+        self.get(&format!("rooms/{}/state/m.room.power_levels", encoded(room)), bot)
+            .map(Option::unwrap_or_default)
+            .map_err(|e| format!("power levels of {room}: {e}"))
+    }
+
+    fn account_data_path(&self, bot: &str, room: Option<&str>, kind: &str) -> String {
+        let user = encoded(&self.user_id(bot));
+        match room {
+            Some(room) => format!("user/{user}/rooms/{}/account_data/{kind}", encoded(room)),
+            None => format!("user/{user}/account_data/{kind}"),
         }
     }
 
@@ -95,16 +128,38 @@ impl Matrix {
         format!("{}/_matrix/client/v3/{path}?user_id={user_id}", self.homeserver)
     }
 
-    fn call(
-        &self,
-        request: ureq::RequestBuilder<ureq::typestate::WithBody>,
-        body: &serde_json::Value,
-    ) -> Result<(), ureq::Error> {
+    /// None when the homeserver answers 404: nothing there yet.
+    fn get(&self, path: &str, bot: &str) -> Result<Option<Value>, String> {
+        let response = ureq::get(self.url(path, bot))
+            .header("Authorization", &format!("Bearer {}", self.as_token))
+            .call();
+        match response {
+            Ok(mut response) => response
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| e.to_string())
+                .and_then(|json| serde_json::from_str(&json).map_err(|e| e.to_string()))
+                .map(Some),
+            Err(ureq::Error::StatusCode(404)) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn put(&self, path: &str, bot: &str, body: &Value) -> Result<(), String> {
+        self.call(ureq::put(self.url(path, bot)), body)
+    }
+
+    fn post(&self, path: &str, bot: &str) -> Result<(), String> {
+        self.call(ureq::post(self.url(path, bot)), &json!({}))
+    }
+
+    fn call(&self, request: ureq::RequestBuilder<ureq::typestate::WithBody>, body: &Value) -> Result<(), String> {
         request
             .header("Authorization", &format!("Bearer {}", self.as_token))
             .header("Content-Type", "application/json")
             .send(body.to_string().as_bytes())
             .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 

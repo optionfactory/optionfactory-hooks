@@ -24,8 +24,9 @@ Threat model, secrets and how to report a vulnerability: [SECURITY.md](SECURITY.
   !clickup connect <API token>    creates the webhook of the workspace; the message with the token is redacted
   !clickup disconnect             deletes it
   ```
-- **Routing lives in the rooms.** Room moderators subscribe a room with a command, and the subscription is stored as
-  state of the room: no database, no configuration to change.
+- **Routing lives in the rooms.** Room moderators subscribe a room with a command, and the bot keeps the
+  subscriptions in its account data for that room: no database, no configuration to change, backed up with the
+  homeserver.
 
   ```
   !github subscribe optionfactory                       every repository of the organization
@@ -65,6 +66,7 @@ listen = "127.0.0.1:8009"                # for the reverse proxy and the homeser
 trusted_proxy = "172.18.0.10"            # the proxy: only from it is X-Forwarded-For believed
 homeserver = "http://127.0.0.1:8008"     # client-server API
 server_name = "optionfactory.net"
+public_url = "https://hooks.opfa.net"     # where the reverse proxy serves the webhooks
 admins = ["@roberto:optionfactory.net"]  # who may enable and disable the integrations
 
 [appservice]
@@ -94,18 +96,19 @@ namespaces:
 
 ## Status
 
-Done: the settings, the listener, the bots registered at start with the secrets of their webhooks read from their
-account data, the signatures of GitHub and ClickUp, the appservice side (token of the homeserver, invitations: join
-and usage, encrypted rooms refused), the Matrix calls as a bot.
+Done:
+
+- the settings, the listener, the appservice side (token of the homeserver; invitations: join and usage; encrypted
+  rooms refused, and left when a room turns encrypted);
+- GitHub, all of it: `!github enable` and `rotate` for the admins, `!github subscribe`, `list` and `unsubscribe` for
+  the moderators, the signature of the deliveries, the events formatted and routed to the organization or the
+  repository.
 
 Next:
 
-1. Commands: the admin ones (`enable`, `rotate`, `connect`, `disconnect`) and the room ones, subscriptions as room
-   state, moderators only.
-2. GitHub events formatted and routed, the organization or one repository.
-3. Script hooks: `!hooks new/list/revoke/avatar`, `/send/<token>` (text or JSON with `text`, `html`, `level`).
-4. ClickUp: task events formatted and routed.
-5. Bot names and avatars set at start, icons built into the binary.
+1. Script hooks: `!hooks new/list/revoke/avatar`, `/send/<token>` (text or JSON with `text`, `html`, `level`).
+2. ClickUp: `!clickup connect` and `disconnect`, subscriptions, task events formatted and routed.
+3. Bot names and avatars set at start, icons built into the binary.
 
 ## Building
 
