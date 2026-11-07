@@ -108,11 +108,12 @@ impl Matrix {
             .unwrap_or_default())
     }
 
-    /// The content of the `m.room.power_levels` of the room.
-    pub fn power_levels(&self, room: &str, bot: &str) -> Result<Value, String> {
-        self.get(&format!("rooms/{}/state/m.room.power_levels", encoded(room)), bot)
-            .map(Option::unwrap_or_default)
-            .map_err(|e| format!("power levels of {room}: {e}"))
+    /// The state events of the room, whole: who sent `m.room.create` is not in its content.
+    pub fn state(&self, room: &str, bot: &str) -> Result<Vec<Value>, String> {
+        let state = self
+            .get(&format!("rooms/{}/state", encoded(room)), bot)
+            .map_err(|e| format!("state of {room}: {e}"))?;
+        Ok(state.and_then(|state| state.as_array().cloned()).unwrap_or_default())
     }
 
     fn account_data_path(&self, bot: &str, room: Option<&str>, kind: &str) -> String {

@@ -75,7 +75,7 @@ fn secret(github: &Github, room: &str, sender: &str, rotate: bool) -> Result<Str
 }
 
 fn subscribe(github: &Github, room: &str, sender: &str, args: &[&str]) -> Result<String, String> {
-    if !moderator(&github.matrix.power_levels(room, BOT)?, sender) {
+    if !moderator(&github.matrix.state(room, BOT)?, sender) {
         return Ok("Only the moderators of the room can change its subscriptions.".to_string());
     }
     let (target, events) = match args {
@@ -108,7 +108,7 @@ fn subscribe(github: &Github, room: &str, sender: &str, args: &[&str]) -> Result
 }
 
 fn unsubscribe(github: &Github, room: &str, sender: &str, args: &[&str]) -> Result<String, String> {
-    if !moderator(&github.matrix.power_levels(room, BOT)?, sender) {
+    if !moderator(&github.matrix.state(room, BOT)?, sender) {
         return Ok("Only the moderators of the room can change its subscriptions.".to_string());
     }
     let [target] = args else {
@@ -158,8 +158,26 @@ fn save(github: &Github, room: &str, subscriptions: Vec<Subscription>) -> Result
     Ok(())
 }
 
-/// A moderator can change the power levels of the room: the level the room asks for that, 50 if it does not say.
-fn moderator(levels: &Value, sender: &str) -> bool {
+/// A moderator can change the power levels of the room: the level the room asks for that, 50 if it does not say. From
+/// room version 12 the creators (who sent `m.room.create`, and its `additional_creators`) are above every level and
+/// are not among the users of the power levels.
+fn moderator(state: &[Value], sender: &str) -> bool {
+    let event = |kind: &str| state.iter().find(|e| e["type"] == kind && e["state_key"] == "");
+    if let Some(create) = event("m.room.create") {
+        let version = create["content"]["room_version"].as_str().unwrap_or("1");
+        let creators_above = version.parse::<u32>().map_or(version.contains("hydra"), |v| v >= 12);
+        let creator = create["sender"] == sender
+            || create["content"]["additional_creators"]
+                .as_array()
+                .is_some_and(|more| more.iter().any(|c| c == sender));
+        if creators_above && creator {
+            return true;
+        }
+    }
+    let levels = event("m.room.power_levels")
+        .map(|e| &e["content"])
+        .cloned()
+        .unwrap_or_default();
     let needed = levels["events"]["m.room.power_levels"]
         .as_i64()
         .or(levels["state_default"].as_i64())
@@ -192,16 +210,27 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn moderators_are_who_can_change_the_power_levels() {
+    fn moderators_are_who_can_change_the_power_levels_and_the_creators_of_newer_rooms() {
+        let state = |version: &str, levels: serde_json::Value| {
+            vec![
+                json!({"type": "m.room.create", "state_key": "", "sender": "@roberto:optionfactory.net",
+                       "content": {"room_version": version, "additional_creators": ["@francesco.degrassi:optionfactory.net"]}}),
+                json!({"type": "m.room.power_levels", "state_key": "", "content": levels}),
+            ]
+        };
         let levels = json!({
-            "users": {"@roberto:optionfactory.net": 100, "@simone:optionfactory.net": 50},
-            "users_default": 0,
+            "users": {"@simone:optionfactory.net": 50, "@mdagri:optionfactory.net": 100},
             "events": {"m.room.power_levels": 100},
         });
-        assert!(super::moderator(&levels, "@roberto:optionfactory.net"));
-        assert!(!super::moderator(&levels, "@simone:optionfactory.net"));
-        assert!(!super::moderator(&levels, "@guest:optionfactory.net"));
-        let default = json!({"users": {"@simone:optionfactory.net": 50}});
+        let v12 = state("12", levels.clone());
+        assert!(super::moderator(&v12, "@roberto:optionfactory.net"));
+        assert!(super::moderator(&v12, "@francesco.degrassi:optionfactory.net"));
+        assert!(super::moderator(&v12, "@mdagri:optionfactory.net"));
+        assert!(!super::moderator(&v12, "@simone:optionfactory.net"));
+        assert!(!super::moderator(&v12, "@guest:optionfactory.net"));
+        let v11 = state("11", levels);
+        assert!(!super::moderator(&v11, "@roberto:optionfactory.net"));
+        let default = state("10", json!({"users": {"@simone:optionfactory.net": 50}}));
         assert!(super::moderator(&default, "@simone:optionfactory.net"));
     }
 
