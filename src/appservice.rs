@@ -1,6 +1,8 @@
+use crate::clickup::Clickup;
 use crate::github::Github;
+use crate::hooks::Hooks;
 use crate::matrix::Matrix;
-use crate::{clickup, github};
+use crate::{clickup, github, hooks, profile};
 use axum::Router;
 use axum::extract::{Json, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -13,7 +15,15 @@ use std::sync::Arc;
 struct Appservice {
     hs_token: String,
     matrix: Arc<Matrix>,
-    github: Arc<Github>,
+    bots: Bots,
+}
+
+/// The features behind the bots, and who may change the names and icons of the bots.
+pub struct Bots {
+    pub github: Arc<Github>,
+    pub clickup: Arc<Clickup>,
+    pub hooks: Arc<Hooks>,
+    pub admins: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -23,15 +33,11 @@ struct Transaction {
 }
 
 /// The side the homeserver calls: the room events that concern the bots.
-pub fn transactions(hs_token: String, matrix: Arc<Matrix>, github: Arc<Github>) -> Router {
+pub fn transactions(hs_token: String, matrix: Arc<Matrix>, bots: Bots) -> Router {
     Router::new()
         .route("/_matrix/app/v1/transactions/{txn}", put(receive))
         .route("/_matrix/app/v1/ping", post(ping))
-        .with_state(Arc::new(Appservice {
-            hs_token,
-            matrix,
-            github,
-        }))
+        .with_state(Arc::new(Appservice { hs_token, matrix, bots }))
 }
 
 async fn ping(State(appservice): State<Arc<Appservice>>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
@@ -50,18 +56,36 @@ async fn receive(
         return (StatusCode::FORBIDDEN, Json(json!({"errcode": "M_FORBIDDEN"})));
     }
     for event in transaction.events {
-        if let Some((room, sender, body)) = command(&event, &appservice.matrix, "!github") {
-            let github = appservice.github.clone();
-            tokio::task::spawn_blocking(move || github::command(&github, &room, &sender, &body));
+        if let Some((prefix, command)) = ["!github", "!clickup", "!hooks"]
+            .into_iter()
+            .find_map(|prefix| command(&event, &appservice.matrix, prefix).map(|command| (prefix, command)))
+        {
+            let appservice = appservice.clone();
+            tokio::task::spawn_blocking(move || {
+                let bots = &appservice.bots;
+                match (prefix, command.body.split_whitespace().nth(1)) {
+                    ("!hooks", _) => hooks::command(&bots.hooks, &command),
+                    ("!github", Some("avatar" | "name")) => {
+                        profile::command(&appservice.matrix, &bots.admins, github::BOT, &command)
+                    }
+                    ("!clickup", Some("avatar" | "name")) => {
+                        profile::command(&appservice.matrix, &bots.admins, clickup::BOT, &command)
+                    }
+                    ("!github", _) => github::command(&bots.github, &command.room, &command.sender, &command.body),
+                    _ => clickup::command(&bots.clickup, &command),
+                }
+            });
             continue;
         }
         if event["type"] == "m.room.encryption" {
             // the bots stay out of encrypted rooms, also of a room that turns encrypted with them in it
             let room = event["room_id"].as_str().unwrap_or_default().to_string();
-            let matrix = appservice.matrix.clone();
+            let appservice = appservice.clone();
             tokio::task::spawn_blocking(move || {
-                for bot in [github::BOT, clickup::BOT] {
-                    if let Err(e) = matrix.leave(&room, bot) {
+                let mut bots: Vec<String> = [github::BOT, clickup::BOT, hooks::BOT].map(String::from).to_vec();
+                bots.extend(appservice.bots.hooks.bots(&room));
+                for bot in bots {
+                    if let Err(e) = appservice.matrix.leave(&room, &bot) {
                         eprintln!("{e}");
                     }
                 }
@@ -99,22 +123,44 @@ fn from_homeserver(headers: &HeaderMap, hs_token: &str) -> bool {
     digest(&SHA256, bearer.as_bytes()).as_ref() == digest(&SHA256, hs_token.as_bytes()).as_ref()
 }
 
-/// A message of a person (not of a bot) starting with `prefix`: the room, the sender and the text.
-fn command(event: &Value, matrix: &Matrix, prefix: &str) -> Option<(String, String, String)> {
+/// A message of a person to one of the bots.
+pub struct Command {
+    pub room: String,
+    pub sender: String,
+    /// The text, without the quote of the message it replies to.
+    pub body: String,
+    /// The event it replies to, if any.
+    pub reply_to: Option<String>,
+    /// Its own event, to redact it when it carried a secret.
+    pub event_id: String,
+}
+
+/// A message of a person (not of a bot) starting with `prefix`, once the quote some apps put at the top of a reply
+/// (`> <@sender> text` lines and a blank one) is left out.
+fn command(event: &Value, matrix: &Matrix, prefix: &str) -> Option<Command> {
     if event["type"] != "m.room.message" {
         return None;
     }
-    let body = event["content"]["body"].as_str()?.trim();
+    let body = event["content"]["body"].as_str()?;
+    let body = body
+        .lines()
+        .skip_while(|line| line.starts_with("> "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = body.trim();
     let sender = event["sender"].as_str()?;
-    let bots = [github::BOT, clickup::BOT].map(|bot| matrix.user_id(bot));
-    if !(body == prefix || body.starts_with(&format!("{prefix} "))) || bots.iter().any(|bot| bot == sender) {
+    if !(body == prefix || body.starts_with(&format!("{prefix} "))) || matrix.is_bot(sender) {
         return None;
     }
-    Some((
-        event["room_id"].as_str()?.to_string(),
-        sender.to_string(),
-        body.to_string(),
-    ))
+    Some(Command {
+        room: event["room_id"].as_str()?.to_string(),
+        sender: sender.to_string(),
+        body: body.to_string(),
+        reply_to: event["content"]["m.relates_to"]["m.in_reply_to"]["event_id"]
+            .as_str()
+            .map(str::to_string),
+        event_id: event["event_id"].as_str().unwrap_or_default().to_string(),
+    })
 }
 
 /// An invitation of one of the bots: the room, the bot and what it says when it joins.
@@ -123,9 +169,13 @@ fn invitation(event: &Value, matrix: &Matrix) -> Option<(String, &'static str, &
         return None;
     }
     let invited = event["state_key"].as_str()?;
-    let (bot, usage) = [(github::BOT, github::USAGE), (clickup::BOT, clickup::USAGE)]
-        .into_iter()
-        .find(|(bot, _)| matrix.user_id(bot) == invited)?;
+    let (bot, usage) = [
+        (github::BOT, github::USAGE),
+        (clickup::BOT, clickup::USAGE),
+        (hooks::BOT, hooks::USAGE),
+    ]
+    .into_iter()
+    .find(|(bot, _)| matrix.user_id(bot) == invited)?;
     Some((event["room_id"].as_str()?.to_string(), bot, usage))
 }
 
@@ -145,7 +195,7 @@ mod tests {
     fn invite(state_key: &str, room_state: serde_json::Value) -> serde_json::Value {
         json!({
             "type": "m.room.member",
-            "room_id": "!room:optionfactory.net",
+            "room_id": "!room:example.org",
             "state_key": state_key,
             "content": {"membership": "invite"},
             "unsigned": {"invite_room_state": room_state},
@@ -154,49 +204,39 @@ mod tests {
 
     #[test]
     fn a_bot_answers_invitations_of_itself_only_and_spots_encrypted_rooms() {
-        let matrix = Matrix::new("http://homeserver".into(), "optionfactory.net".into(), "token".into());
-        let plain = invite("@github:optionfactory.net", json!([{"type": "m.room.name"}]));
+        let matrix = Matrix::new("http://homeserver".into(), "example.org".into(), "token".into());
+        let plain = invite("@github:example.org", json!([{"type": "m.room.name"}]));
         let (room, bot, _) = super::invitation(&plain, &matrix).unwrap();
-        assert_eq!((room.as_str(), bot), ("!room:optionfactory.net", "github"));
+        assert_eq!((room.as_str(), bot), ("!room:example.org", "github"));
         assert!(!super::encrypted(&plain));
-        assert!(super::invitation(&invite("@roberto:optionfactory.net", json!([])), &matrix).is_none());
-        let encrypted = invite("@clickup:optionfactory.net", json!([{"type": "m.room.encryption"}]));
+        assert!(super::invitation(&invite("@alice:example.org", json!([])), &matrix).is_none());
+        let encrypted = invite("@clickup:example.org", json!([{"type": "m.room.encryption"}]));
         assert!(super::encrypted(&encrypted));
     }
 
     #[test]
     fn commands_are_messages_of_people_starting_with_the_prefix() {
-        let matrix = Matrix::new("http://homeserver".into(), "optionfactory.net".into(), "token".into());
+        let matrix = Matrix::new("http://homeserver".into(), "example.org".into(), "token".into());
         let message = |sender: &str, body: &str| {
-            json!({"type": "m.room.message", "room_id": "!room:optionfactory.net", "sender": sender,
+            json!({"type": "m.room.message", "room_id": "!room:example.org", "sender": sender,
                    "content": {"msgtype": "m.text", "body": body}})
         };
-        let (room, sender, body) = super::command(
-            &message("@roberto:optionfactory.net", " !github list "),
-            &matrix,
-            "!github",
-        )
-        .unwrap();
+        let command = super::command(&message("@alice:example.org", " !github list "), &matrix, "!github").unwrap();
         assert_eq!(
-            (room.as_str(), sender.as_str(), body.as_str()),
-            ("!room:optionfactory.net", "@roberto:optionfactory.net", "!github list")
+            (command.room.as_str(), command.sender.as_str(), command.body.as_str()),
+            ("!room:example.org", "@alice:example.org", "!github list")
         );
-        assert!(super::command(&message("@roberto:optionfactory.net", "!githubber"), &matrix, "!github").is_none());
-        assert!(
-            super::command(
-                &message("@roberto:optionfactory.net", "talk about !github"),
-                &matrix,
-                "!github"
-            )
-            .is_none()
+        let reply = json!({"type": "m.room.message", "room_id": "!room:example.org",
+            "sender": "@alice:example.org",
+            "content": {"msgtype": "m.text", "body": "> <@alice:example.org> sent an image.\n\n!github avatar",
+                        "m.relates_to": {"m.in_reply_to": {"event_id": "$image"}}}});
+        let command = super::command(&reply, &matrix, "!github").unwrap();
+        assert_eq!(
+            (command.body.as_str(), command.reply_to.as_deref()),
+            ("!github avatar", Some("$image"))
         );
-        assert!(
-            super::command(
-                &message("@github:optionfactory.net", "!github list"),
-                &matrix,
-                "!github"
-            )
-            .is_none()
-        );
+        assert!(super::command(&message("@alice:example.org", "!githubber"), &matrix, "!github").is_none());
+        assert!(super::command(&message("@alice:example.org", "talk about !github"), &matrix, "!github").is_none());
+        assert!(super::command(&message("@github:example.org", "!github list"), &matrix, "!github").is_none());
     }
 }

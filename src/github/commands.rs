@@ -1,6 +1,7 @@
 use super::{BOT, Github, NOISE, SECRET, SUBSCRIPTIONS, Subscription, USAGE};
+use crate::matrix::moderator;
 use ring::rand::SecureRandom;
-use serde_json::{Value, json};
+use serde_json::json;
 
 /// A message starting with `!github` in a room of the bot; blocking. The answer goes to the same room.
 pub fn command(github: &Github, room: &str, sender: &str, body: &str) {
@@ -30,9 +31,7 @@ fn secret(github: &Github, room: &str, sender: &str, rotate: bool) -> Result<Str
     if !github.admins.iter().any(|admin| admin == sender) {
         return Ok("Only the admins of the service can do that.".to_string());
     }
-    let members = github.matrix.joined_members(room, BOT)?;
-    let me = github.matrix.user_id(BOT);
-    if members.len() != 2 || !members.iter().any(|m| m == sender) || !members.contains(&me) {
+    if !github.matrix.alone_with(room, BOT, sender)? {
         return Ok(
             "I send the secret only in a room with you and me alone: create one without encryption and \
             invite me there."
@@ -158,37 +157,6 @@ fn save(github: &Github, room: &str, subscriptions: Vec<Subscription>) -> Result
     Ok(())
 }
 
-/// A moderator can change the power levels of the room: the level the room asks for that, 50 if it does not say. From
-/// room version 12 the creators (who sent `m.room.create`, and its `additional_creators`) are above every level and
-/// are not among the users of the power levels.
-fn moderator(state: &[Value], sender: &str) -> bool {
-    let event = |kind: &str| state.iter().find(|e| e["type"] == kind && e["state_key"] == "");
-    if let Some(create) = event("m.room.create") {
-        let version = create["content"]["room_version"].as_str().unwrap_or("1");
-        let creators_above = version.parse::<u32>().map_or(version.contains("hydra"), |v| v >= 12);
-        let creator = create["sender"] == sender
-            || create["content"]["additional_creators"]
-                .as_array()
-                .is_some_and(|more| more.iter().any(|c| c == sender));
-        if creators_above && creator {
-            return true;
-        }
-    }
-    let levels = event("m.room.power_levels")
-        .map(|e| &e["content"])
-        .cloned()
-        .unwrap_or_default();
-    let needed = levels["events"]["m.room.power_levels"]
-        .as_i64()
-        .or(levels["state_default"].as_i64())
-        .unwrap_or(50);
-    let level = levels["users"][sender]
-        .as_i64()
-        .or(levels["users_default"].as_i64())
-        .unwrap_or(0);
-    level >= needed
-}
-
 /// `owner` or `owner/repository`, with the characters GitHub allows in them.
 fn valid_target(target: &str) -> bool {
     let parts: Vec<&str> = target.split('/').collect();
@@ -207,39 +175,13 @@ fn valid_event(event: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
-    #[test]
-    fn moderators_are_who_can_change_the_power_levels_and_the_creators_of_newer_rooms() {
-        let state = |version: &str, levels: serde_json::Value| {
-            vec![
-                json!({"type": "m.room.create", "state_key": "", "sender": "@roberto:optionfactory.net",
-                       "content": {"room_version": version, "additional_creators": ["@francesco.degrassi:optionfactory.net"]}}),
-                json!({"type": "m.room.power_levels", "state_key": "", "content": levels}),
-            ]
-        };
-        let levels = json!({
-            "users": {"@simone:optionfactory.net": 50, "@mdagri:optionfactory.net": 100},
-            "events": {"m.room.power_levels": 100},
-        });
-        let v12 = state("12", levels.clone());
-        assert!(super::moderator(&v12, "@roberto:optionfactory.net"));
-        assert!(super::moderator(&v12, "@francesco.degrassi:optionfactory.net"));
-        assert!(super::moderator(&v12, "@mdagri:optionfactory.net"));
-        assert!(!super::moderator(&v12, "@simone:optionfactory.net"));
-        assert!(!super::moderator(&v12, "@guest:optionfactory.net"));
-        let v11 = state("11", levels);
-        assert!(!super::moderator(&v11, "@roberto:optionfactory.net"));
-        let default = state("10", json!({"users": {"@simone:optionfactory.net": 50}}));
-        assert!(super::moderator(&default, "@simone:optionfactory.net"));
-    }
 
     #[test]
     fn targets_are_an_owner_or_a_repository() {
-        assert!(super::valid_target("optionfactory"));
-        assert!(super::valid_target("optionfactory/ior-portal"));
-        assert!(!super::valid_target("optionfactory/ior/portal"));
-        assert!(!super::valid_target("optionfactory/"));
+        assert!(super::valid_target("acme"));
+        assert!(super::valid_target("acme/widgets"));
+        assert!(!super::valid_target("acme/widgets/extra"));
+        assert!(!super::valid_target("acme/"));
         assert!(!super::valid_target("<script>"));
         assert!(super::valid_event("pull_request"));
         assert!(!super::valid_event("Pull-Request"));

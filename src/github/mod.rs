@@ -9,7 +9,7 @@ use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -18,7 +18,7 @@ pub use commands::command;
 pub const BOT: &str = "github";
 pub const USAGE: &str = "I post the events of GitHub. Room moderators: `!github subscribe <owner or owner/repository> \
     [event,...]`, `!github list`, `!github unsubscribe <owner or owner/repository>`. Admins, in a room with only me: \
-    `!github enable`, `!github rotate`.";
+    `!github enable`, `!github rotate`; anywhere: `!github name <name>`, `!github avatar` in reply to an image.";
 /// Account data of the bot with the secret of the webhook.
 const SECRET: &str = "net.optionfactory.hooks.github";
 /// Account data of the bot in each room, with the subscriptions of the room.
@@ -36,7 +36,7 @@ pub struct Github {
     public_url: String,
 }
 
-/// An organization (`optionfactory`) or a repository (`optionfactory/ior-portal`), with the events wanted; none means
+/// An organization (`acme`) or a repository (`acme/widgets`), with the events wanted; none means
 /// all but the noise.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Subscription {
@@ -112,12 +112,7 @@ async fn receive(
         &event,
         &payload,
     );
-    let content = json!({
-        "msgtype": if message.alert { "m.text" } else { "m.notice" },
-        "body": message.text,
-        "format": "org.matrix.custom.html",
-        "formatted_body": message.html,
-    });
+    let content = message.content();
     // answered at once: GitHub gives up on a delivery after ten seconds
     tokio::task::spawn_blocking(move || {
         for room in rooms {
@@ -192,21 +187,18 @@ mod tests {
             events: events.iter().map(|e| e.to_string()).collect(),
         };
         let subscriptions = HashMap::from([
-            ("!org".to_string(), vec![subscribe("optionfactory", &[])]),
-            (
-                "!ior".to_string(),
-                vec![subscribe("optionfactory/ior-portal", &["release"])],
-            ),
+            ("!acme".to_string(), vec![subscribe("acme", &[])]),
+            ("!widgets".to_string(), vec![subscribe("acme/widgets", &["release"])]),
             ("!other".to_string(), vec![subscribe("someone-else", &[])]),
         ]);
-        let ior = json!({
-            "repository": {"full_name": "optionfactory/ior-portal", "owner": {"login": "optionfactory"}},
-            "organization": {"login": "optionfactory"},
+        let widgets = json!({
+            "repository": {"full_name": "acme/widgets", "owner": {"login": "acme"}},
+            "organization": {"login": "acme"},
         });
-        assert_eq!(super::rooms(&subscriptions, "push", &ior), ["!org"]);
-        assert_eq!(super::rooms(&subscriptions, "release", &ior), ["!ior", "!org"]);
-        assert!(super::rooms(&subscriptions, "check_run", &ior).is_empty());
-        let member = json!({"organization": {"login": "OptionFactory"}});
-        assert_eq!(super::rooms(&subscriptions, "organization", &member), ["!org"]);
+        assert_eq!(super::rooms(&subscriptions, "push", &widgets), ["!acme"]);
+        assert_eq!(super::rooms(&subscriptions, "release", &widgets), ["!acme", "!widgets"]);
+        assert!(super::rooms(&subscriptions, "check_run", &widgets).is_empty());
+        let member = json!({"organization": {"login": "Acme"}});
+        assert_eq!(super::rooms(&subscriptions, "organization", &member), ["!acme"]);
     }
 }

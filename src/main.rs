@@ -1,7 +1,10 @@
 mod appservice;
 mod clickup;
 mod github;
+mod hooks;
 mod matrix;
+mod message;
+mod profile;
 
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::middleware::{self, Next};
@@ -127,20 +130,26 @@ fn serve(settings: Settings) -> Result<(), String> {
         let loaded = {
             let matrix = matrix.clone();
             tokio::task::spawn_blocking(move || {
-                let github = github::Github::load(matrix.clone(), admins, public_url)?;
-                matrix.register(clickup::BOT)?;
-                let clickup = matrix.account_data(clickup::BOT, None, clickup::SETTINGS)?;
-                let clickup = clickup.and_then(|data| data["secret"].as_str().map(str::to_string));
-                Ok::<_, String>((Arc::new(github), clickup))
+                let github = github::Github::load(matrix.clone(), admins.clone(), public_url.clone())?;
+                let clickup = clickup::Clickup::load(matrix.clone(), admins.clone(), public_url.clone())?;
+                let hooks = hooks::Hooks::load(matrix.clone(), admins.clone(), public_url)?;
+                Ok::<_, String>((Arc::new(github), Arc::new(clickup), Arc::new(hooks), admins))
             })
             .await
             .map_err(|e| e.to_string())?
         };
-        let (github, clickup_secret) = loaded?;
-        // the reverse proxy forwards /github and /clickup only: the appservice paths are for the homeserver
-        let app = appservice::transactions(hs_token, matrix.clone(), github.clone())
+        let (github, clickup, hooks, admins) = loaded?;
+        // the reverse proxy forwards /github, /clickup and /send/ only: the appservice paths are for the homeserver
+        let bots = appservice::Bots {
+            github: github.clone(),
+            clickup: clickup.clone(),
+            hooks: hooks.clone(),
+            admins,
+        };
+        let app = appservice::transactions(hs_token, matrix.clone(), bots)
             .merge(github::webhook(github))
-            .merge(clickup::webhook(clickup_secret, matrix.clone()));
+            .merge(clickup::webhook(clickup))
+            .merge(hooks::sending(hooks));
         // the payloads of big pushes reach a few megabytes
         let app = app
             .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
@@ -199,9 +208,9 @@ mod tests {
             .and_then(|rest| rest.split("```").next())
             .unwrap();
         let settings = Settings::parse(example).unwrap();
-        assert_eq!(settings.admins, ["@roberto:optionfactory.net"]);
+        assert_eq!(settings.admins, ["@alice:example.org"]);
         assert!(Settings::parse(&example.replace("trusted_proxy", "trusted_proxi")).is_err());
-        assert!(Settings::parse(&example.replace("@roberto:optionfactory.net", "roberto@optionfactory.net")).is_err());
+        assert!(Settings::parse(&example.replace("@alice:example.org", "alice@example.org")).is_err());
     }
 
     #[test]
