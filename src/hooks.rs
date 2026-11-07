@@ -19,7 +19,8 @@ pub const BOT: &str = "hooks";
 pub const USAGE: &str = "I give scripts a bot of their own in this room. Room moderators: `!hooks new <name> \
     [display name]` (the URL with the token comes to you in a direct room), `!hooks list`, `!hooks revoke <name>`. \
     Who created a hook, or an admin: `!hooks name <name> <display name>`, `!hooks avatar <name>` in reply to an image. \
-    Sending: `curl -d 'text' <URL>`, or JSON with `text`, `html` and `level` (`error` notifies).";
+    Sending: `curl -d 'text' <URL>`, or JSON with `text`, `html`, `level` (`error` notifies) and `mention` (`room`: \
+    @room, with power 50 for the bot).";
 /// Account data of `@hooks` in each room, with the hooks of the room.
 const HOOKS: &str = "net.optionfactory.hooks.hooks";
 
@@ -137,29 +138,35 @@ async fn send(
     StatusCode::ACCEPTED
 }
 
-/// The message of a script: a notice, or a normal message for `"level": "error"`.
+/// The message of a script: a notice, or a normal message for `"level": "error"`; `"mention": "room"` notifies the
+/// whole room, which takes the power level the room asks for `@room` (50 unless it says otherwise) for the bot.
 fn content(json: bool, body: &[u8]) -> Option<Value> {
-    let (text, html, level) = if json {
+    let (text, html, level, room) = if json {
         let sent: Value = serde_json::from_slice(body).ok()?;
         (
             sent["text"].as_str()?.to_string(),
             sent["html"].as_str().map(str::to_string),
             sent["level"].as_str().unwrap_or_default().to_string(),
+            sent["mention"] == "room",
         )
     } else {
-        (String::from_utf8(body.to_vec()).ok()?, None, String::new())
+        (String::from_utf8(body.to_vec()).ok()?, None, String::new(), false)
     };
     let text = text.trim();
     if text.is_empty() {
         return None;
     }
+    let mention = if room { "@room " } else { "" };
     let mut content = json!({
         "msgtype": if level == "error" { "m.text" } else { "m.notice" },
-        "body": text,
+        "body": format!("{mention}{text}"),
     });
     if let Some(html) = html {
         content["format"] = json!("org.matrix.custom.html");
-        content["formatted_body"] = json!(html);
+        content["formatted_body"] = json!(format!("{mention}{html}"));
+    }
+    if room {
+        content["m.mentions"] = json!({"room": true});
     }
     Some(content)
 }
@@ -340,6 +347,15 @@ mod tests {
         );
         assert_eq!(super::content(false, b"  "), None);
         assert_eq!(super::content(true, br#"{"html": "no text"}"#), None);
+    }
+
+    #[test]
+    fn a_script_can_notify_the_whole_room() {
+        let sent = br#"{"text": "UPS: on battery", "level": "error", "mention": "room"}"#;
+        assert_eq!(
+            super::content(true, sent).unwrap(),
+            json!({"msgtype": "m.text", "body": "@room UPS: on battery", "m.mentions": {"room": true}})
+        );
     }
 
     #[test]

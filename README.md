@@ -63,8 +63,9 @@ Threat model, secrets and how to report a vulnerability: [SECURITY.md](SECURITY.
   curl -fsS -H 'Content-Type: application/json' -d '{"text": "backup failed", "level": "error"}' "$HOOK_URL"
   ```
 
-  JSON takes `text`, an optional `html` and `level`: `error` makes a normal message, which notifies, instead of a
-  notice. A hook bot is one identity for the whole server: a second room gets the same bot with its own token.
+  JSON takes `text`, an optional `html`, `level`: `error` makes a normal message, which notifies, instead of a
+  notice, and `mention`: `room` mentions the whole room (`@room`), which needs the bot at the power level the room
+  asks for it, 50 unless it says otherwise. A hook bot is one identity for the whole server: a second room gets the same bot with its own token.
 - **Notices.** Messages go out as `m.notice`, which most clients do not push; failures as normal messages.
 
 ## Running
