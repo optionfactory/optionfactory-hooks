@@ -41,8 +41,14 @@ Threat model, secrets and how to report a vulnerability: [SECURITY.md](SECURITY.
   ```
 
   A subscription without events takes them all except the noise of continuous integration (`check_run`,
-  `check_suite`, `workflow_job`, `status`); a finished workflow run is reported once. Events without their own format
-  get a line with who, what and where.
+  `check_suite`, `workflow_job`, `status`). Events without their own format get a line with who, what and where.
+- **The look**, taken from maubot's GitHub plugin: one sentence per event, `[owner/repo] alice merged pull request
+  #12: Title` or `[List] alice moved task Checkout from [to do] to [in progress]`, the state in the verb, no emoji.
+  Colour only where GitHub and ClickUp have it: labels, statuses and priorities as pills in their colours. Pushes as
+  a list of commits, comments and descriptions quoted and rendered from Markdown (their HTML shown as text, their
+  images as links), no link previews. A workflow run is a reaction on the message of its push, `🔵 build` then
+  `🟢 build`, replaced as it goes on; when that push is not known (a restart, a room without pushes), a finished run
+  is a message, and a failure notifies.
 - **GitHub:** one webhook for the organization, its signature (`X-Hub-Signature-256`) checked on every delivery.
 - **ClickUp:** one webhook for the workspace, its signature (`X-Signature`) checked on every delivery. A delivery
   does not say where the task is, so the bot reads the task from the API with the token of the connection, and

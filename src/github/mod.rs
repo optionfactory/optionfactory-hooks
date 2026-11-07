@@ -10,8 +10,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub use commands::command;
 
@@ -31,9 +31,38 @@ pub struct Github {
     key: RwLock<Option<ring::hmac::Key>>,
     /// Room ID to its subscriptions, as in the account data of the bot in that room.
     subscriptions: RwLock<HashMap<String, Vec<Subscription>>>,
+    /// The push messages of the latest commits, for the reactions of their workflow runs.
+    pushes: Mutex<Pushes>,
     matrix: Arc<Matrix>,
     admins: Vec<String>,
     public_url: String,
+}
+
+/// In memory only: after a restart a run whose push is not known posts its outcome as a message.
+#[derive(Default)]
+struct Pushes {
+    /// (room, head commit) to the event of the push message.
+    messages: HashMap<(String, String), String>,
+    /// (room, head commit, workflow) to the reaction showing its state.
+    reactions: HashMap<(String, String, String), String>,
+    /// The oldest first, to forget beyond `REMEMBERED`.
+    order: VecDeque<(String, String)>,
+}
+
+const REMEMBERED: usize = 500;
+
+impl Pushes {
+    fn remember(&mut self, room: &str, commit: &str, event: String) {
+        let key = (room.to_string(), commit.to_string());
+        self.messages.insert(key.clone(), event);
+        self.order.push_back(key);
+        while self.order.len() > REMEMBERED {
+            if let Some((room, commit)) = self.order.pop_front() {
+                self.messages.remove(&(room.clone(), commit.clone()));
+                self.reactions.retain(|(r, c, _), _| *r != room || *c != commit);
+            }
+        }
+    }
 }
 
 /// An organization (`acme`) or a repository (`acme/widgets`), with the events wanted; none means
@@ -66,6 +95,7 @@ impl Github {
         Ok(Github {
             key: RwLock::new(key),
             subscriptions: RwLock::new(subscriptions),
+            pushes: Mutex::new(Pushes::default()),
             matrix,
             admins,
             public_url: public_url.trim_end_matches('/').to_string(),
@@ -104,24 +134,83 @@ async fn receive(
     let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
         return StatusCode::BAD_REQUEST;
     };
-    let Some(message) = events::message(&event, &payload) else {
-        return StatusCode::ACCEPTED;
-    };
     let rooms = rooms(
         &github.subscriptions.read().unwrap_or_else(|e| e.into_inner()),
         &event,
         &payload,
     );
-    let content = message.content();
+    if rooms.is_empty() {
+        return StatusCode::ACCEPTED;
+    }
     // answered at once: GitHub gives up on a delivery after ten seconds
     tokio::task::spawn_blocking(move || {
-        for room in rooms {
-            if let Err(e) = github.matrix.send(&room, BOT, &content) {
-                eprintln!("github: {e}");
-            }
+        let outcome = if event == "workflow_run" {
+            workflow_run(&github, &rooms, &payload)
+        } else {
+            announce(&github, &rooms, &event, &payload)
+        };
+        if let Err(e) = outcome {
+            eprintln!("github: {e}");
         }
     });
     StatusCode::ACCEPTED
+}
+
+/// The message of the event in each room; a push is remembered by its head commit, for its workflow runs.
+fn announce(github: &Github, rooms: &[String], event: &str, payload: &Value) -> Result<(), String> {
+    let Some(message) = events::message(event, payload) else {
+        return Ok(());
+    };
+    for room in rooms {
+        let sent = github.matrix.send(room, BOT, &message.content())?;
+        if let (true, Some(commit)) = (event == "push", payload["after"].as_str()) {
+            let mut pushes = github.pushes.lock().unwrap_or_else(|e| e.into_inner());
+            pushes.remember(room, commit, sent);
+        }
+    }
+    Ok(())
+}
+
+/// A reaction on the push of the commit (`🔵 build`, then `🟢 build`), replaced as the run goes on; where the push is
+/// not known, the outcome as a message once the run is over.
+fn workflow_run(github: &Github, rooms: &[String], payload: &Value) -> Result<(), String> {
+    let Some((key, done)) = events::ci(payload) else {
+        return Ok(());
+    };
+    let run = &payload["workflow_run"];
+    let commit = run["head_sha"].as_str().unwrap_or_default().to_string();
+    let name = run["name"].as_str().unwrap_or_default().to_string();
+    for room in rooms {
+        let (push, previous) = {
+            let pushes = github.pushes.lock().unwrap_or_else(|e| e.into_inner());
+            let place = (room.clone(), commit.clone());
+            let push = pushes.messages.get(&place).cloned();
+            let previous = pushes
+                .reactions
+                .get(&(room.clone(), commit.clone(), name.clone()))
+                .cloned();
+            (push, previous)
+        };
+        match push {
+            Some(push) => {
+                if let Some(previous) = previous {
+                    github.matrix.redact(room, &previous, BOT)?;
+                }
+                let reaction = github.matrix.react(room, BOT, &push, &key)?;
+                let mut pushes = github.pushes.lock().unwrap_or_else(|e| e.into_inner());
+                pushes
+                    .reactions
+                    .insert((room.clone(), commit.clone(), name.clone()), reaction);
+            }
+            None if done => {
+                if let Some(message) = events::message("workflow_run", payload) {
+                    github.matrix.send(room, BOT, &message.content())?;
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(())
 }
 
 /// The rooms subscribed to the organization or the repository of the event, and to its kind.

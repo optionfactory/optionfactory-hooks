@@ -1,3 +1,4 @@
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use serde_json::{Value, json};
 
 /// A message for a room, as plain text and as HTML; `alert` for a normal message instead of a notice, which most
@@ -10,12 +11,14 @@ pub struct Message {
 }
 
 impl Message {
+    /// Without link previews: a card for every link would bury the feed.
     pub fn content(&self) -> Value {
         json!({
             "msgtype": if self.alert { "m.text" } else { "m.notice" },
             "body": self.text,
             "format": "org.matrix.custom.html",
             "formatted_body": self.html,
+            "com.beeper.linkpreviews": [],
         })
     }
 }
@@ -32,12 +35,6 @@ impl Line {
     pub fn text(&mut self, text: &str) -> &mut Self {
         self.text.push_str(text);
         self.html.push_str(&escaped(text));
-        self
-    }
-
-    pub fn bold(&mut self, text: &str) -> &mut Self {
-        self.text.push_str(text);
-        self.html.push_str(&format!("<b>{}</b>", escaped(text)));
         self
     }
 
@@ -59,17 +56,6 @@ impl Line {
         self
     }
 
-    pub fn bold_link(&mut self, text: &str, url: &Value) -> &mut Self {
-        self.text.push_str(text);
-        match url.as_str() {
-            Some(url) => self
-                .html
-                .push_str(&format!("<a href=\"{}\"><b>{}</b></a>", escaped(url), escaped(text))),
-            None => self.html.push_str(&format!("<b>{}</b>", escaped(text))),
-        }
-        self
-    }
-
     pub fn code_link(&mut self, text: &str, url: &Value) -> &mut Self {
         self.text.push_str(text);
         match url.as_str() {
@@ -83,37 +69,93 @@ impl Line {
         self
     }
 
-    pub fn break_line(&mut self) -> &mut Self {
-        self.text.push('\n');
-        self.html.push_str("<br>");
+    /// `[owner/repo]` or `[List]` at the start of a message, bold and linked.
+    pub fn prefix(&mut self, name: &str, url: &Value) -> &mut Self {
+        self.text.push_str(&format!("[{name}] "));
+        let name = match url.as_str() {
+            Some(url) => format!("<a href=\"{}\">{}</a>", escaped(url), escaped(name)),
+            None => escaped(name),
+        };
+        self.html.push_str(&format!("<b>[{name}]</b> "));
         self
     }
 
-    /// The first `lines` non-empty lines of a text written by someone (a comment, a description), at most 300
-    /// characters, as a quote; nothing when it is empty.
-    pub fn quote(&mut self, body: &Value, lines: usize) -> &mut Self {
-        let kept: Vec<&str> = body
-            .as_str()
-            .unwrap_or_default()
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .take(lines)
-            .collect();
-        if kept.is_empty() {
+    /// A label or a status in its own colour, as GitHub and ClickUp show them; the text black or white, whichever
+    /// reads better on it.
+    pub fn pill(&mut self, name: &str, color: Option<&str>, description: Option<&str>) -> &mut Self {
+        self.text.push_str(&format!("[{name}]"));
+        let background = color
+            .map(|c| c.trim_start_matches('#'))
+            .filter(|c| c.len() == 6 && c.chars().all(|c| c.is_ascii_hexdigit()))
+            .unwrap_or("ededed");
+        let title = description
+            .filter(|d| !d.is_empty())
+            .map(|d| format!(" title=\"{}\"", escaped(d)))
+            .unwrap_or_default();
+        self.html.push_str(&format!(
+            "<font data-mx-bg-color=\"#{background}\" data-mx-color=\"{}\"{title}>&nbsp;{}&nbsp;</font>",
+            readable_on(background),
+            escaped(name)
+        ));
+        self
+    }
+
+    /// Items one per line, as a list.
+    pub fn list(&mut self, items: Vec<Message>) -> &mut Self {
+        if items.is_empty() {
             return self;
         }
-        let joined = kept.join("\n");
-        let mut quoted: String = joined.chars().take(300).collect();
-        if quoted.len() < joined.len() || body.as_str().unwrap_or_default().trim().len() > joined.len() {
-            quoted.push_str(" ...");
+        self.html.push_str("<ul>");
+        for item in items {
+            self.text.push_str(&format!("\n- {}", item.text));
+            self.html.push_str(&format!("<li>{}</li>", item.html));
         }
-        for line in quoted.lines() {
-            self.text.push_str(&format!("\n> {line}"));
+        self.html.push_str("</ul>");
+        self
+    }
+
+    /// Markdown written by someone (a comment, a description), at most `max` characters of it, as a quote: rendered,
+    /// with their HTML shown as text and their images as links, since a room shows only images of its server.
+    pub fn quote(&mut self, body: &Value, max: usize) -> &mut Self {
+        let source = without_comments(body.as_str().unwrap_or_default());
+        let source = source.trim();
+        if source.is_empty() {
+            return self;
         }
-        let html: Vec<String> = quoted.lines().map(escaped).collect();
+        let mut kept: String = source.chars().take(max).collect();
+        if kept.len() < source.len() {
+            // cut at the end of a line, not inside a word or a code span
+            if let Some(end) = kept.rfind('\n').filter(|end| *end > max / 2) {
+                kept.truncate(end);
+            }
+            kept.push_str("\n\n…");
+        }
+        for line in kept.lines().filter(|line| !line.trim().is_empty()) {
+            self.text.push_str(&format!("\n> {}", line.trim_end()));
+        }
+        let events =
+            Parser::new_ext(&kept, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS).map(
+                |event| match event {
+                    Event::Html(html) | Event::InlineHtml(html) => Event::Text(html),
+                    Event::Start(Tag::Image {
+                        link_type,
+                        dest_url,
+                        title,
+                        id,
+                    }) => Event::Start(Tag::Link {
+                        link_type,
+                        dest_url,
+                        title,
+                        id,
+                    }),
+                    Event::End(TagEnd::Image) => Event::End(TagEnd::Link),
+                    other => other,
+                },
+            );
+        let mut html = String::new();
+        pulldown_cmark::html::push_html(&mut html, events);
         self.html
-            .push_str(&format!("<blockquote>{}</blockquote>", html.join("<br>")));
+            .push_str(&format!("<blockquote>{}</blockquote>", html.trim_end()));
         self
     }
 
@@ -138,24 +180,84 @@ pub fn escaped(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// The templates of pull requests and issues are full of `<!-- -->` hints nobody sees on GitHub.
+fn without_comments(text: &str) -> String {
+    let mut kept = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<!--") {
+        kept.push_str(&rest[..start]);
+        rest = rest[start..].find("-->").map_or("", |end| &rest[start + end + 3..]);
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// White text where it reads well enough (WCAG contrast 4.5), as GitHub shows its labels; otherwise whichever of black
+/// and white has the higher contrast on the background.
+fn readable_on(background: &str) -> &'static str {
+    let channel = |i: usize| {
+        let c = u8::from_str_radix(&background[i..i + 2], 16).unwrap_or(0) as f64 / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4);
+    let (on_white, on_black) = (1.05 / (luminance + 0.05), (luminance + 0.05) / 0.05);
+    if on_white >= 4.5 || on_white >= on_black {
+        "#ffffff"
+    } else {
+        "#000000"
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Line;
+    use super::{Line, readable_on};
     use serde_json::json;
 
     #[test]
-    fn text_and_html_go_side_by_side_and_what_people_wrote_is_escaped() {
+    fn text_and_html_go_side_by_side_and_what_people_wrote_is_rendered_but_not_trusted() {
         let m = Line::default()
-            .bold("alice")
-            .text(" commented on ")
-            .link("#3", &json!("https://x/3?a=1&b=2"))
-            .quote(&json!("first <b>line</b>\n\nsecond\nthird\nfourth"), 2)
+            .prefix("acme/widgets", &json!("https://github.com/acme/widgets"))
+            .text("alice commented on ")
+            .link("issue #3", &json!("https://x/3?a=1&b=2"))
+            .quote(
+                &json!("<!-- template hint -->\nLooks **good**, <script>x</script>\n\n![shot](https://img/1.png)"),
+                500,
+            )
             .done();
-        assert_eq!(m.text, "alice commented on #3\n> first <b>line</b>\n> second ...");
+        assert_eq!(
+            m.text,
+            "[acme/widgets] alice commented on issue #3\n> Looks **good**, <script>x</script>\n> ![shot](https://img/1.png)"
+        );
         assert_eq!(
             m.html,
-            "<b>alice</b> commented on <a href=\"https://x/3?a=1&amp;b=2\">#3</a>\
-             <blockquote>first &lt;b&gt;line&lt;/b&gt;<br>second ...</blockquote>"
+            "<b>[<a href=\"https://github.com/acme/widgets\">acme/widgets</a>]</b> alice commented on \
+             <a href=\"https://x/3?a=1&amp;b=2\">issue #3</a><blockquote><p>Looks <strong>good</strong>, \
+             &lt;script&gt;x&lt;/script&gt;</p>\n<p><a href=\"https://img/1.png\">shot</a></p></blockquote>"
         );
+    }
+
+    #[test]
+    fn labels_get_their_colour_and_readable_text() {
+        let m = Line::default()
+            .pill("bug", Some("d73a4a"), Some("Something isn't working"))
+            .done();
+        assert_eq!(m.text, "[bug]");
+        assert_eq!(
+            m.html,
+            "<font data-mx-bg-color=\"#d73a4a\" data-mx-color=\"#ffffff\" title=\"Something isn't working\">&nbsp;bug&nbsp;</font>"
+        );
+        assert_eq!(readable_on("fbca04"), "#000000");
+        assert_eq!(readable_on("0e1a2b"), "#ffffff");
+    }
+
+    #[test]
+    fn long_quotes_are_cut_at_a_line() {
+        let body = json!("first line of the description\nsecond line, which goes on and on and on\nthird");
+        let m = Line::default().quote(&body, 50).done();
+        assert_eq!(m.text, "\n> first line of the description\n> …");
     }
 }

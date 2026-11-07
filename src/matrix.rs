@@ -38,15 +38,26 @@ impl Matrix {
             .is_some_and(|bot| matches!(bot, "github" | "clickup" | "hooks") || bot.starts_with("hooks-"))
     }
 
-    /// Posts an `m.room.message` as `bot`.
-    pub fn send(&self, room: &str, bot: &str, content: &Value) -> Result<(), String> {
+    /// Posts an `m.room.message` as `bot`; its event ID.
+    pub fn send(&self, room: &str, bot: &str, content: &Value) -> Result<String, String> {
+        self.send_event(room, bot, "m.room.message", content)
+            .map_err(|e| format!("message to {room} as {bot}: {e}"))
+    }
+
+    /// A reaction of the bot to an event; its event ID, to take it back.
+    pub fn react(&self, room: &str, bot: &str, event: &str, key: &str) -> Result<String, String> {
+        let content = json!({"m.relates_to": {"rel_type": "m.annotation", "event_id": event, "key": key}});
+        self.send_event(room, bot, "m.reaction", &content)
+            .map_err(|e| format!("reaction in {room} as {bot}: {e}"))
+    }
+
+    fn send_event(&self, room: &str, bot: &str, kind: &str, content: &Value) -> Result<String, String> {
         let txn = format!("{}-{}", self.started, self.sent.fetch_add(1, Ordering::Relaxed));
-        self.put(
-            &format!("rooms/{}/send/m.room.message/{txn}", encoded(room)),
-            bot,
+        let sent = self.call(
+            ureq::put(self.url(&format!("rooms/{}/send/{kind}/{txn}", encoded(room)), bot)),
             content,
-        )
-        .map_err(|e| format!("message to {room} as {bot}: {e}"))
+        )?;
+        Ok(sent["event_id"].as_str().unwrap_or_default().to_string())
     }
 
     pub fn join(&self, room: &str, bot: &str) -> Result<(), String> {

@@ -103,6 +103,7 @@ async fn receive(
                     matrix
                         .join(&room, bot)
                         .and_then(|()| matrix.send(&room, bot, &json!({"msgtype": "m.notice", "body": usage})))
+                        .map(|_| ())
                 };
                 if let Err(e) = outcome {
                     eprintln!("{e}");
