@@ -40,8 +40,9 @@ Threat model, secrets and how to report a vulnerability: [SECURITY.md](SECURITY.
   !github list / unsubscribe ...
   ```
 
-  A subscription without events takes them all except the noise of continuous integration (`check_run`,
-  `check_suite`, `workflow_job`, `status`). Events without their own format get a line with who, what and where.
+  A subscription without events takes them all except the noise of continuous integration and deployments
+  (`check_run`, `check_suite`, `workflow_job`, `status`, `deployment`, `deployment_status`, `page_build`). Events
+  without their own format get a line with who, what and where.
 - **The look**, taken from maubot's GitHub plugin: one sentence per event, `[owner/repo] alice merged pull request
   #12: Title` or `[List] alice moved task Checkout from [to do] to [in progress]`, the state in the verb, no emoji.
   Colour only where GitHub and ClickUp have it: labels, statuses and priorities as pills in their colours. Pushes as

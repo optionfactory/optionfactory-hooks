@@ -24,7 +24,15 @@ const SECRET: &str = "net.optionfactory.hooks.github";
 /// Account data of the bot in each room, with the subscriptions of the room.
 const SUBSCRIPTIONS: &str = "net.optionfactory.hooks.github.subscriptions";
 /// Taken only when a subscription names them: a push brings a dozen of them. A run is reported by `workflow_run`.
-const NOISE: [&str; 4] = ["check_run", "check_suite", "workflow_job", "status"];
+const NOISE: [&str; 7] = [
+    "check_run",
+    "check_suite",
+    "workflow_job",
+    "status",
+    "deployment",
+    "deployment_status",
+    "page_build",
+];
 
 pub struct Github {
     /// None until an admin enables the webhook.
