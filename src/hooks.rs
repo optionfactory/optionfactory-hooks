@@ -152,10 +152,11 @@ fn content(json: bool, body: &[u8]) -> Option<Value> {
     } else {
         (String::from_utf8(body.to_vec()).ok()?, None, String::new(), false)
     };
-    let text = text.trim();
+    let text = crate::message::with_emoji(text.trim());
     if text.is_empty() {
         return None;
     }
+    let html = html.map(|html| crate::message::with_emoji(&html));
     let mention = if room { "@room " } else { "" };
     let mut content = json!({
         "msgtype": if level == "error" { "m.text" } else { "m.notice" },
@@ -339,11 +340,11 @@ mod tests {
             super::content(false, b"deployed\n").unwrap(),
             json!({"msgtype": "m.notice", "body": "deployed"})
         );
-        let sent = br#"{"text": "backup failed", "html": "backup <b>failed</b>", "level": "error"}"#;
+        let sent = br#"{"text": ":fire: backup failed", "html": ":fire: backup <b>failed</b>", "level": "error"}"#;
         assert_eq!(
             super::content(true, sent).unwrap(),
-            json!({"msgtype": "m.text", "body": "backup failed",
-                   "format": "org.matrix.custom.html", "formatted_body": "backup <b>failed</b>"})
+            json!({"msgtype": "m.text", "body": "🔥 backup failed",
+                   "format": "org.matrix.custom.html", "formatted_body": "🔥 backup <b>failed</b>"})
         );
         assert_eq!(super::content(false, b"  "), None);
         assert_eq!(super::content(true, br#"{"html": "no text"}"#), None);
