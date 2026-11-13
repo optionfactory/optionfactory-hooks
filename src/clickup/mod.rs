@@ -106,6 +106,10 @@ async fn receive(
     // the delivery does not say where the task is: the task itself, from the API, does
     tokio::task::spawn_blocking(move || {
         let event = payload["event"].as_str().unwrap_or_default();
+        // webhooks created before EVENTS still deliver every event
+        if !events::EVENTS.contains(&event) {
+            return;
+        }
         let Some(task_id) = payload["task_id"].as_str() else {
             return;
         };

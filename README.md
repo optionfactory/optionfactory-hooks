@@ -53,7 +53,8 @@ Threat model, secrets and how to report a vulnerability: [SECURITY.md](SECURITY.
 - **GitHub:** one webhook for the organization, its signature (`X-Hub-Signature-256`) checked on every delivery.
 - **ClickUp:** one webhook for the workspace, its signature (`X-Signature`) checked on every delivery. A delivery
   does not say where the task is, so the bot reads the task from the API with the token of the connection, and
-  routes it by its list, folder and space.
+  routes it by its list, folder and space. The webhook asks only for new tasks, status, assignee, due date and
+  priority changes, comments and moves; edits, time tracking and deletions are left out.
 - **Scripts:** invite `@hooks` to the room, then a moderator creates a hook: `@hooks-<name>` joins, and the URL
   with the token goes to who asked in a new direct room with `@hooks`, so that the other members of the room, guests
   included, never see it. The bot keeps only the hash of the token.

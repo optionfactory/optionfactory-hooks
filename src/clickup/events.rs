@@ -1,19 +1,31 @@
 use crate::message::{Line, Message};
 use serde_json::Value;
 
+/// The events the webhook asks for and the bot tells. Left out as noise: edits (description, name, attachments,
+/// custom fields, tags, comments), time tracking, deletions, and the changes to lists, folders, spaces and goals.
+pub const EVENTS: [&str; 7] = [
+    "taskCreated",
+    "taskStatusUpdated",
+    "taskAssigneeUpdated",
+    "taskCommentPosted",
+    "taskDueDateUpdated",
+    "taskPriorityUpdated",
+    "taskMoved",
+];
+
 /// The message of a task change, with the task as the API gives it: `[List] user verb task`, statuses in their
-/// colours. None for the noise of time tracking.
+/// colours. None for the events outside `EVENTS` and for the first status of a new task, which `taskCreated` tells.
 pub fn message(event: &str, payload: &Value, task: &Value) -> Option<Message> {
     let item = &payload["history_items"][0];
     let user = item["user"]["username"].as_str().unwrap_or("someone");
     let mut m = Line::default();
     m.prefix(task["list"]["name"].as_str().unwrap_or("ClickUp"), &Value::Null);
     match event {
-        "taskTimeTrackedUpdated" | "taskTimeEstimateUpdated" => return None,
         "taskCreated" => {
             m.text(&format!("{user} created "));
             named(&mut m, task);
         }
+        "taskStatusUpdated" if !item["before"]["status"].is_string() => return None,
         "taskStatusUpdated" => {
             m.text(&format!("{user} moved "));
             named(&mut m, task);
@@ -60,16 +72,7 @@ pub fn message(event: &str, payload: &Value, task: &Value) -> Option<Message> {
             named(&mut m, task);
             m.text(" here");
         }
-        "taskUpdated" => {
-            let field = item["field"].as_str().unwrap_or("details");
-            m.text(&format!("{user} changed the {} of ", field.replace('_', " ")));
-            named(&mut m, task);
-        }
-        "taskDeleted" => return None,
-        _ => {
-            m.text(&format!("{user} ")).code(event).text(" on ");
-            named(&mut m, task);
-        }
+        _ => return None,
     }
     Some(m.done())
 }
@@ -116,5 +119,14 @@ mod tests {
             "[Widgets Sprint] Carol Roe commented on task Checkout\n> Done on staging.\n> Check it please."
         );
         assert_eq!(message("taskTimeTrackedUpdated", &payload, &task()), None);
+    }
+
+    #[test]
+    fn a_new_task_is_told_once_and_edits_are_left_out() {
+        let first_status = json!({"history_items": [{"user": {"username": "Dave Doe"}, "before": null,
+            "after": {"status": "open", "color": "#d3d3d3"}}]});
+        let description = json!({"history_items": [{"user": {"username": "Dave Doe"}, "field": "content"}]});
+        assert_eq!(message("taskStatusUpdated", &first_status, &task()), None);
+        assert_eq!(message("taskUpdated", &description, &task()), None);
     }
 }

@@ -86,7 +86,7 @@ fn connect(clickup: &Clickup, command: &Command, args: &[&str]) -> Result<String
     let created = api_post(
         token,
         &format!("team/{team}/webhook"),
-        &json!({"endpoint": endpoint, "events": ["*"]}),
+        &json!({"endpoint": endpoint, "events": super::events::EVENTS}),
     )?;
     let (Some(webhook), Some(secret)) = (created["id"].as_str(), created["webhook"]["secret"].as_str()) else {
         return Err(format!("webhook of {team}: unexpected answer {created}"));
